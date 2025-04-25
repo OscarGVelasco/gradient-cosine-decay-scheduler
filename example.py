@@ -112,13 +112,11 @@ def plot_lr_schedule_comparison(total_epochs=100, initial_lr=0.001, final_lr=0):
     # Return the basic configuration learning rates for reference
     return lrs
 
-
-def simulate_training_with_scheduler(total_epochs=20, initial_lr=0.001):
+def simulate_training_with_scheduler(model, total_epochs=20, initial_lr=0.001):
     """
     Simulate a training loop to demonstrate how to use the scheduler in practice.
     """
     # Create a simple model and dummy data
-    model = SimpleModel()
     batch_size = 32
     input_size = 784
     
@@ -220,6 +218,7 @@ def simulate_training_with_scheduler(total_epochs=20, initial_lr=0.001):
 if __name__ == "__main__":
     # Run the comparison plot
     print("Generating learning rate schedule comparison...")
+    
     plot_lr_schedule_comparison(total_epochs=100, initial_lr=0.001, final_lr=0)
     
     # Run the training simulation

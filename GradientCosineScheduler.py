@@ -1,12 +1,13 @@
 import torch
 from torch.optim.lr_scheduler import _LRScheduler
+from torch.optim.lr_scheduler import _LRScheduler
 import math
 
 class GradientCosineScheduler(_LRScheduler):
     def __init__(self, optimizer, total_epochs, steps_per_epoch, model, 
                  initial_lr=0.01, final_lr=0.00001, 
                  warmup_epochs=0,
-                 gradient_scale=0.15, oscillation_frequency=1.0,
+                 gradient_scale=0.15, oscillation_frequency=4.0,
                  last_epoch=-1, verbose=False):
         """
         Args:
@@ -24,15 +25,32 @@ class GradientCosineScheduler(_LRScheduler):
             verbose: Print learning rate updates
         """
         self.total_epochs = total_epochs
-        self.total_steps = steps_per_epoch
-        self.warmup_epochs = warmup_epochs
-        self.min_lr = final_lr
-        self.alpha = final_lr/10
+        self.steps_per_epoch = steps_per_epoch
+        self.total_steps = steps_per_epoch*total_epochs
         self.initial_lr = initial_lr
+        self.min_lr = final_lr
+        self.alpha = final_lr*0.1
         self.model = model
         
+        # Warm-up and init lr
+        self.warmup_epochs = warmup_epochs
+        if self.warmup_epochs > 0:
+            # Correct total step number if warmup steps
+            self.total_steps = self.total_steps - (self.warmup_epochs*self.steps_per_epoch)
+            # We start with a 0.1 of the minimum lr for warmp-up
+            self.actual_lr = self.alpha
+            # Smooth transition from linear warmup to cos intial wave at initial lr
+            self.phi=-(math.pi/2)
+        # No warmup
+        else:
+            self.actual_lr = self.initial_lr
+            # If no warmpup we start the wave at maximum x negative position
+            self.phi=math.pi
+
+        # Compute the linear step-decay (How much the lr decrease each step)
+        self.linear_step_decay = (self.initial_lr - self.min_lr)*((self.total_steps-1) / self.total_steps)
+
         # Oscillation parameters
-        self.base_oscillation_amplitude = initial_lr
         self.oscillation_amplitude = initial_lr
         self.gradient_scale = gradient_scale
         self.base_oscillation_frequency = oscillation_frequency
@@ -55,7 +73,18 @@ class GradientCosineScheduler(_LRScheduler):
         
         super(GradientCosineScheduler, self).__init__(optimizer, last_epoch, verbose)
         # Initiate lrs:
-        self._set_initial_lrs()
+        self._set_initial_lrs(optimizer)
+
+    def _set_initial_lrs(self, optimizer):
+        """
+        Initialize the scheduler at the start of training
+        """
+        # Set initial learning rates
+        self.base_lrs_original = [group['lr'] for group in optimizer.param_groups]
+        self.base_lrs = [self.actual_lr for _ in optimizer.param_groups]
+        # Update learning rates
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = self.actual_lr
 
     @staticmethod
     def harmonic_cos(self, x_O, A, W, t, phi):
@@ -70,17 +99,97 @@ class GradientCosineScheduler(_LRScheduler):
         Returns:
             Oscillation value
         """
-        x_t = x_O + (A * math.cos((W * t) + phi))
-        x_t = max(x_t, self.alpha)
+        x_t = max(x_O + (A * math.cos((W * t) + phi)), self.alpha)
         return x_t
+            
+    def get_lr(self):
+        
+        # Oscillation amplitude modulated by gradient norm
+        gradient_factor = min(1.0, self.last_grad_norm * self.gradient_scale)
+                
+        W = (2 * math.pi) / (self.steps_per_epoch/self.oscillation_frequency)
+
+        # Compute learning rate with oscillation
+        lr_values = [
+            self.harmonic_cos(
+                x_O=self.actual_lr, 
+                A=self.oscillation_amplitude, 
+                W=W, 
+                t=self.current_step, 
+                phi=self.phi
+            ) for _ in self.base_lrs
+        ]
+
+        # Final learning rate with oscillation
+        return lr_values
     
-    def _set_initial_lrs(self):
+    def step(self, optimizer):
         """
-        Initialize the scheduler at the start of training
+        Update learning rate step
+        """        
+        # In warm-up phase
+        if self.warmup_epochs > 0 and self.last_epoch < self.warmup_epochs:
+            # Linear warmup from min_lr to initial_lr
+            warmup_factor = self.last_epoch / self.warmup_epochs
+            self.actual_lr = self.alpha + (self.initial_lr - self.alpha) * warmup_factor
+            return [self.actual_lr for _ in self.base_lrs]
+
+        # After warmup, calculate main schedule
+        self.actual_lr = self.actual_lr - self.linear_step_decay
         """
-        # Set initial learning rates
-        self.base_lrs_original = [group['lr'] for group in self.optimizer.param_groups]
-        self.base_lrs = [self.initial_lr for _ in self.optimizer.param_groups]
+        if self.warmup_epochs > 0:
+            # Adjust progress to account for warmup
+            current_progress = (self.last_epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
+        else:
+            current_progress = self.last_epoch / self.total_epochs
+        """
+
+        # Gradient-aware amplitude modulation
+        #gradient_factor = min(1.0, self.last_grad_norm * self.gradient_scale)
+        #current_amplitude = self.oscillation_amplitude * gradient_factor
+        
+        # Oscillation frequency adjusted by model size
+        #current_frequency = self.oscillation_frequency / (1.0 + self.model_size_factor)   
+
+        # Compute learning rate with oscillation
+        lr_values = self.get_lr()
+        
+        # Update learning rates
+        for param_group, lr in zip(optimizer.param_groups, lr_values):
+            param_group['lr'] = lr
+        
+        # Increment step
+        self.current_step += 1
+    
+    def epoch_end(self):
+        """
+        Adjust oscillation frequency based on gradient behavior in the previous epoch.
+        Called at the end of each epoch to set frequency for the next epoch.
+        """
+        if not self.epoch_grad_norms:
+            return  # No gradient information available yet
+        
+        # Calculate gradient statistics for the epoch
+        avg_grad_norm = sum(self.epoch_grad_norms) / len(self.epoch_grad_norms)
+        grad_variance = sum((g - avg_grad_norm) ** 2 for g in self.epoch_grad_norms) / len(self.epoch_grad_norms)
+        
+        # Normalize variance to a reasonable range (0.5 to 2.0)
+        normalized_variance = min(2.0, max(0.5, 1.0 + grad_variance / (avg_grad_norm + 1e-8)))
+        print(f"Epoch {self.current_epoch}: Normalized variance: {self.normalized_variance:.4f}")
+
+        # Adjust frequency based on gradient behavior
+        # Higher variance → more oscillations needed for exploration
+        # Lower variance → fewer oscillations for exploitation
+        #self.current_frequency = self.base_oscillations_per_epoch * normalized_variance / (1.0 + self.model_size_factor)
+        
+        # Reset for next epoch
+        self.epoch_grad_norms = []
+        self.steps_in_current_epoch = 0
+        #self.current_step = 0
+        self.current_epoch += 1
+        
+        if self.verbose:
+            print(f"Epoch {self.current_epoch}: Setting oscillation frequency to {self.current_frequency:.4f}")
     
     def update_gradient_norm(self, optimizer=None):
         """
@@ -110,110 +219,3 @@ class GradientCosineScheduler(_LRScheduler):
             self.epoch_grad_norms.append(avg_norm)
         
         return self.last_grad_norm
-    
-    def get_lr(self):
-                
-        # Oscillation frequency adjusted by model size
-        frequency = self.oscillation_frequency / (1.0 + self.model_size_factor)
-        
-        # Oscillation amplitude modulated by gradient norm
-        gradient_factor = min(1.0, self.last_grad_norm * self.gradient_scale)
-        amplitude = self.oscillation_amplitude * gradient_factor * linear_decay_rate
-        
-        # Phase offset to ensure we start at the lowest point of cosine
-        phase_offset = math.pi / 2
-        
-        # Cosine oscillation around the linear decay trajectory
-        oscillation = amplitude * math.cos(current_progress * math.pi * 2 * frequency * 5 + phase_offset)
-        
-        # Final learning rate with oscillation
-        return [max(self.min_lr, linear_decay + oscillation) for _ in self.base_lrs]
-    
-    def step(self):
-        """
-        Update learning rate step
-        """        
-        # In warm-up phase
-        if self.warmup_epochs > 0 and self.last_epoch < self.warmup_epochs:
-            # Linear warmup from min_lr to initial_lr
-            warmup_factor = self.last_epoch / self.warmup_epochs
-            return [self.min_lr + (self.initial_lr - self.min_lr) * warmup_factor 
-                    for _ in self.base_lrs]
-
-        # After warmup, calculate main schedule
-        if self.warmup_epochs > 0:
-            # Adjust progress to account for warmup
-            current_progress = (self.last_epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
-        else:
-            current_progress = self.last_epoch / self.total_epochs
-        
-        # Ensure current_progress is clipped to [0, 1]
-        current_progress = min(max(0, current_progress), 1)
-        
-        # Linear decay trajectory from initial_lr to min_lr
-        linear_decay_rate = (self.initial_lr - self.min_lr) * (1.0 - current_progress)
-        linear_decay = self.min_lr + linear_decay_rate
-
-
-
-        # Calculate progress within the current epoch
-        progress_in_epoch = self.current_step / self.total_steps
-        
-        # Linear decay base
-        progress_overall = (self.current_epoch + progress_in_epoch) / self.total_epochs
-        linear_decay_rate = (self.initial_lr - self.min_lr) * (1.0 - progress_overall)
-        linear_decay = self.min_lr + linear_decay_rate
-        
-        # Gradient-aware amplitude modulation
-        gradient_factor = min(1.0, self.last_grad_norm * self.gradient_scale)
-        current_amplitude = self.oscillation_amplitude * gradient_factor
-        
-        # Oscillation frequency adjusted by model size
-        current_frequency = self.oscillation_frequency / (1.0 + self.model_size_factor)
-        
-        # Compute learning rate with oscillation
-        lr_values = [
-            self.harmonic_cos(
-                x_O=linear_decay, 
-                A=current_amplitude * linear_decay_rate, 
-                W=current_frequency * 2 * math.pi, 
-                t=progress_in_epoch, 
-                phi=math.pi
-            ) for _ in self.base_lrs
-        ]
-        
-        # Update learning rates
-        for param_group, lr in zip(self.optimizer.param_groups, lr_values):
-            param_group['lr'] = lr
-        
-        # Increment step
-        self.current_step += 1
-    
-    def epoch_end(self):
-        """
-        Adjust oscillation frequency based on gradient behavior in the previous epoch.
-        Called at the end of each epoch to set frequency for the next epoch.
-        """
-        if not self.epoch_grad_norms:
-            return  # No gradient information available yet
-        
-        # Calculate gradient statistics for the epoch
-        avg_grad_norm = sum(self.epoch_grad_norms) / len(self.epoch_grad_norms)
-        grad_variance = sum((g - avg_grad_norm) ** 2 for g in self.epoch_grad_norms) / len(self.epoch_grad_norms)
-        
-        # Normalize variance to a reasonable range (0.5 to 2.0)
-        normalized_variance = min(2.0, max(0.5, 1.0 + grad_variance / (avg_grad_norm + 1e-8)))
-        
-        # Adjust frequency based on gradient behavior
-        # Higher variance → more oscillations needed for exploration
-        # Lower variance → fewer oscillations for exploitation
-        self.current_frequency = self.base_oscillations_per_epoch * normalized_variance / (1.0 + self.model_size_factor)
-        
-        # Reset for next epoch
-        self.epoch_grad_norms = []
-        self.steps_in_current_epoch = 0
-        self.current_step = 0
-        self.current_epoch += 1
-        
-        if self.verbose:
-            print(f"Epoch {self.current_epoch}: Setting oscillation frequency to {self.current_frequency:.4f}")
