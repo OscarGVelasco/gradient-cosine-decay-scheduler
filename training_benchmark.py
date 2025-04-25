@@ -8,16 +8,21 @@ from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import _LRScheduler
 import torchvision
 import torchvision.transforms as transforms
-from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.models import resnet50
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
-import GradientCosineScheduler
+import torch.optim.lr_scheduler as lr_sch
+from GradientCosineScheduler import GradientCosineScheduler
+from GradientCosineOOPScheduler import GradientCosineOOPScheduler
+import torchvision.models as tmodels
 
 def load_data(dataset_name, batch_size=128, num_workers=4):
     """
     Load dataset and create data loaders
-    
+
+    AVAILABLE DATASETS: https://pytorch.org/vision/main/datasets.html
     Args:
         dataset_name (str): Name of the dataset (currently supports 'CIFAR10', 'CIFAR100')
         batch_size (int): Batch size for training and testing
@@ -48,9 +53,9 @@ def load_data(dataset_name, batch_size=128, num_workers=4):
         num_classes = 10
     elif dataset_name.upper() == 'CIFAR100':
         train_dataset = torchvision.datasets.CIFAR100(
-            root='./data', train=True, download=True, transform=train_transform)
+            root='./data', train=True, download=False, transform=train_transform)
         test_dataset = torchvision.datasets.CIFAR100(
-            root='./data', train=False, download=True, transform=test_transform)
+            root='./data', train=False, download=False, transform=test_transform)
         num_classes = 100
     else:
         raise ValueError(f"Dataset {dataset_name} not supported")
@@ -68,6 +73,64 @@ def load_data(dataset_name, batch_size=128, num_workers=4):
     
     return train_loader, test_loader, num_classes
 
+def get_lr_scheduler(scheduler_name, optimizer, steps_per_epoch, model, num_epochs):
+    """
+    Load scheduler and initiate
+    
+    Args:
+        scheduler_name (str): Name of the scheduler
+        
+    Returns:
+        scheduler
+    """
+    # Select dataset
+    if scheduler_name == 'LinearLR':
+        scheduler = lr_sch.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=num_epochs)
+    if scheduler_name == 'GradientCosineScheduler':
+        initial_lr=0.01
+        final_lr=0.001
+        warmup_epochs=0
+        oscillation_frequency=4.0
+        scheduler = GradientCosineScheduler(
+            optimizer, num_epochs, steps_per_epoch, model,
+            initial_lr=initial_lr, final_lr=final_lr,
+            warmup_epochs=warmup_epochs,
+            oscillation_frequency=oscillation_frequency
+        )
+    if scheduler_name == 'GradientCosineSchedulerAuto':
+        initial_lr=0.01
+        final_lr=0.001
+        warmup_epochs=0
+        oscillation_frequency=4.0
+        scheduler = GradientCosineScheduler(
+            optimizer, num_epochs, steps_per_epoch, model,
+            mode="auto", initial_lr=initial_lr, final_lr=final_lr,
+            warmup_epochs=warmup_epochs,
+            oscillation_frequency=oscillation_frequency
+        )
+    if scheduler_name == 'GradientCosineOOPScheduler':
+        initial_lr=0.01
+        final_lr=0.001
+        warmup_epochs=0
+        gradient_scale=0.15
+        oscillation_frequency=4.0
+        scheduler = GradientCosineOOPScheduler(
+            optimizer, num_epochs, steps_per_epoch, model,
+            initial_lr=initial_lr, final_lr=final_lr,
+            warmup_epochs=warmup_epochs,
+            gradient_scale=gradient_scale, 
+            oscillation_frequency=oscillation_frequency
+        )
+    if scheduler_name == 'ExponentialLR':
+        scheduler = lr_sch.ExponentialLR(optimizer, gamma=0.9)
+    if scheduler_name == 'CosineAnnealingLR':
+        scheduler = lr_sch.CosineAnnealingLR(optimizer, T_max=10, eta_min=0)
+    if scheduler_name == 'CyclicLR':
+        scheduler = lr_sch.CyclicLR(optimizer, base_lr=0.001, max_lr=0.1,step_size_up=5,mode="exp_range",gamma=0.95)
+
+    print("Loaded LR scheduler: "+scheduler_name)
+    return scheduler
+        
 def get_model(config):
     """
     Create a model based on the configuration
@@ -84,7 +147,10 @@ def get_model(config):
     if model_name == "ResNet":
         if model_config == "resnet50":
             # No weights - random initialization
-            model = resnet50(weights=None)
+            model = tmodels.resnet50(weights=None)
+    elif model_name == "ResNext":
+        if model_config == "resnext101":
+            model = tmodels.resnext101_32x8d(weights=None)    
         else:
             raise ValueError(f"Unsupported ResNet configuration: {model_config}")
     # Add more model types here as needed
@@ -100,6 +166,8 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device):
     correct = 0
     total = 0
     current_lr = optimizer.param_groups[0]['lr']
+    # Create DataFrame to store scheduler metrics
+    scheduler_data = []
     
     with tqdm(train_loader, desc=f"Training (LR: {current_lr:.6f})") as pbar:
         for inputs, targets in pbar:
@@ -109,26 +177,53 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device):
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
+            # Update Gradient tracking on scheduler
+            if scheduler and isinstance(scheduler, GradientCosineScheduler):
+                scheduler.update_gradient_norm()
             optimizer.step()
             
             # Update scheduler if it's step-based (not epoch-based)
             if scheduler and isinstance(scheduler, GradientCosineScheduler):
                 scheduler.step()
-                current_lr = scheduler.get_lr()[0]
+            elif scheduler and isinstance(scheduler, GradientCosineOOPScheduler):
+                scheduler.step()
+            #current_lr = scheduler.actual_lr
+            current_lr = optimizer.param_groups[0]["lr"]
+            if scheduler and isinstance(scheduler, GradientCosineOOPScheduler):
+                current_lr = pd.DataFrame([ [i,group["lr"]] for i,group in enumerate(optimizer.param_groups)])
+                current_lr.columns = ["layer", "lr"]
             
             running_loss += loss.item()
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
-            
+            current_accuracy = 100. * correct / total
+
+            # Collect scheduler data
+            if scheduler and isinstance(scheduler, GradientCosineOOPScheduler):
+                step_data = current_lr.assign(epoch=scheduler.last_epoch, step=scheduler._step_count, loss=loss.item(), accuracy=current_accuracy)
+            else:
+                step_data = {
+                    'epoch': scheduler.last_epoch,
+                    'step': scheduler._step_count,
+                    'lr': current_lr,
+                    'loss': loss.item(),
+                    'accuracy': current_accuracy
+                }
+            scheduler_data.append(step_data)
+
             # Update progress bar
             pbar.set_postfix({
                 'loss': running_loss / (pbar.n + 1),
                 'acc': 100. * correct / total,
-                'lr': current_lr
+                'lr': optimizer.param_groups[0]['lr'],
+                'avg grad_norm': scheduler.epoch_grad_norms[-1]
             })
-    
-    return running_loss / len(train_loader), 100. * correct / total, current_lr
+    if scheduler and isinstance(scheduler, GradientCosineOOPScheduler):
+        scheduler_df = pd.concat(scheduler_data)
+    else:
+        scheduler_df = pd.DataFrame(scheduler_data)
+    return running_loss / len(train_loader), 100. * correct / total, optimizer.param_groups[0]["lr"], scheduler_df
 
 def validate(model, test_loader, criterion, device):
     """Evaluate the model on the test set"""
@@ -157,21 +252,20 @@ def validate(model, test_loader, criterion, device):
     
     return running_loss / len(test_loader), 100. * correct / total
 
-def benchmark_model(config, dataset_name, num_epochs=100, batch_size=128, 
-                   initial_lr=0.01, final_lr=0.00001, warmup_epochs=5,
-                   gradient_scale=0.15, oscillation_frequency=4.0):
+def benchmark_model(config, dataset_name, scheduler_name, num_epochs=100, batch_size=128, 
+                   initial_lr=0.01, final_lr=0.00001, warmup_epochs=5, oscillation_frequency=4.0):
     """
     Benchmark a model with the custom scheduler
     
     Args:
         config (dict): Model configuration
         dataset_name (str): Name of the dataset to use
+        scheduler_name (str): Name of the scheduler to use
         num_epochs (int): Number of training epochs
         batch_size (int): Batch size for training
         initial_lr (float): Initial learning rate
         final_lr (float): Final learning rate
         warmup_epochs (int): Number of warmup epochs
-        gradient_scale (float): Scale factor for gradient in the scheduler
         oscillation_frequency (float): Frequency of cosine oscillation
         
     Returns:
@@ -186,6 +280,7 @@ def benchmark_model(config, dataset_name, num_epochs=100, batch_size=128,
     )
     
     # Get model
+    model = None
     model = get_model(config)
     
     # Modify final layer if needed to match the number of classes
@@ -202,87 +297,104 @@ def benchmark_model(config, dataset_name, num_epochs=100, batch_size=128,
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=initial_lr, momentum=0.9, weight_decay=5e-4)
-    
     # Scheduler
+    #scheduler_name = "ExponentialLR"
+    #scheduler_name = "LinearLR"
     steps_per_epoch = len(train_loader)
-    scheduler = GradientCosineScheduler(
-        optimizer, num_epochs, steps_per_epoch, model,
-        initial_lr=initial_lr, final_lr=final_lr,
-        warmup_epochs=warmup_epochs,
-        gradient_scale=gradient_scale, 
-        oscillation_frequency=oscillation_frequency
-    )
-    
+    #scheduler = get_lr_scheduler("GradientCosineScheduler")
+    # scheduler = get_lr_scheduler("CosineAnnealingLR")
+    scheduler = get_lr_scheduler(scheduler_name, optimizer, steps_per_epoch, model, num_epochs)
     # Initialize tracking variables
-    results = {
-        "model_config": config,
-        "dataset": dataset_name,
-        "epochs": [],
-        "train_loss": [],
-        "train_acc": [],
-        "val_loss": [],
-        "val_acc": [],
-        "learning_rates": [],
-        "best_acc": 0.0,
-        "total_time": 0.0
-    }
-    
-    # Training loop
+    results = []
+    results_val = []
     start_time = time.time()
+    best_acc = 0.0
     for epoch in range(num_epochs):
+    #for epoch in range(10):
         print(f"\nEpoch {epoch+1}/{num_epochs}")
         
+        # Training loop
         # Train
-        train_loss, train_acc, current_lr = train_epoch(
-            model, train_loader, criterion, optimizer, scheduler, device
-        )
+        train_loss, train_acc, current_lr, epoch_stats = train_epoch(model, train_loader, criterion, optimizer, scheduler, device)
         
         # Validate
         val_loss, val_acc = validate(model, test_loader, criterion, device)
-        
-        # Update scheduler if it's epoch-based
-        if scheduler and not isinstance(scheduler, GradientCosineScheduler):
-            scheduler.step()
-        
+                
         # Track results
-        results["epochs"].append(epoch + 1)
-        results["train_loss"].append(train_loss)
-        results["train_acc"].append(train_acc)
-        results["val_loss"].append(val_loss)
-        results["val_acc"].append(val_acc)
-        results["learning_rates"].append(current_lr)
-        
+        results.append(epoch_stats)
+        # Collect scheduler data
+        validation_data = {
+            'epoch': epoch,
+            'lr': current_lr,
+            'loss': val_loss,
+            'accuracy': val_acc
+        }
+        results_val.append(validation_data)
         # Save best model
-        if val_acc > results["best_acc"]:
-            results["best_acc"] = val_acc
+        # 41.29 for Linear
+        # 48.9 FOR COSINE
+        # 46.46 for Cosine Annealing
+        if val_acc > best_acc and val_acc > 0.9:
+            best_acc = val_acc
             model_name = list(config.keys())[0] + "_" + config[list(config.keys())[0]]
-            torch.save(model.state_dict(), f"best_{model_name}_{dataset_name}.pth")
+            #torch.save(model.state_dict(), f"best_{model_name}_{dataset_name}.pth")
             print(f"New best accuracy: {val_acc:.2f}%! Saved model checkpoint.")
-    
+        else:
+            print(f"[no improv.] Actual accuracy: {val_acc:.2f}%")
+        # Update scheduler if it's epoch-based
+        if scheduler and isinstance(scheduler, GradientCosineScheduler):
+            scheduler.epoch_end()
+        elif scheduler and isinstance(scheduler, GradientCosineOOPScheduler):
+            scheduler.epoch_end()
+        else:
+            scheduler.step()
+
     # Calculate total time
-    results["total_time"] = time.time() - start_time
-    
+    #results["total_time"] = time.time() - start_time
+    results = pd.concat(results)
+    results_val = pd.DataFrame(results_val)
     # Save results
     model_name = list(config.keys())[0] + "_" + config[list(config.keys())[0]]
-    results_file = f"benchmark_{model_name}_{dataset_name}.json"
-    with open(results_file, 'w') as f:
-        json.dump(results, f, indent=4)
-    
+    results_file = f"benchmark_{model_name}_{dataset_name}_{scheduler_name}.csv"
+    results.to_csv(results_file)
+    results_file_val = f"benchmark_{model_name}_{dataset_name}_{scheduler_name}_validation.csv"
+    results_val.to_csv(results_file_val)
+    print("Training Finished")
+    print("Maximum Validation Acc: "+ str(best_acc))
     print(f"Results saved to {results_file}")
     
     # Plot results
-    plot_results(results)
+    #plot_results(results)
     
     return results
 
-def plot_results(results):
-    """Plot training curves"""
-    plt.figure(figsize=(15, 10))
+def extract_lr_value(lr):
+    if isinstance(lr, list):
+        return lr[0]
+    return lr
     
+def plot_results(results, results_val):
+    """Plot training curves"""
+    plt.figure(figsize=(60, 15))
     # Plot accuracy
-    plt.subplot(2, 2, 1)
-    plt.plot(results["epochs"], results["train_acc"], label="Training Accuracy")
-    plt.plot(results["epochs"], results["val_acc"], label="Validation Accuracy")
+    #plt.subplot(2, 2, 1)
+    #plt.plot(results["step"], results["lr"], label="Learning rate per step")
+    plt.plot(results["step"], [extract_lr_value(a) for a in results["lr"]], label="Learning rate per step")
+    plt.savefig(f"benchmark_lrs_per_epoch.png",  format='png')
+
+    # Plot accuracy
+    plt.figure(figsize=(30, 20))
+    plt.plot(results["step"], results["accuracy"], label="accuracy rate per step")
+
+    plt.figure(figsize=(30, 20))
+    plt.plot(results_val["epoch"], results_val["accuracy"], label="accuracy rate per step")
+    plt.plot(results["epoch"], results["accuracy"], label="accuracy rate per step")
+
+    plt.figure(figsize=(8, 6))
+    plt.plot(results_val["epoch"], results_val["loss"], label="accuracy rate per step")
+    plt.plot(results["epoch"], results["loss"], label="accuracy rate per step")
+
+    plt.plot(results["step"], results["loss"], label="Validation Loss")
     plt.xlabel("Epoch")
     plt.ylabel("Accuracy (%)")
     plt.title("Model Accuracy")
@@ -313,7 +425,7 @@ def plot_results(results):
     plt.savefig(f"benchmark_{model_name}_{results['dataset']}.png")
     plt.close()
 
-def run_benchmarks(configs, dataset_name, **kwargs):
+def run_benchmarks(configs, dataset_name, num_epochs=100, **kwargs):
     """
     Run benchmarks for multiple model configurations
     
@@ -323,39 +435,47 @@ def run_benchmarks(configs, dataset_name, **kwargs):
         **kwargs: Additional arguments for benchmark_model function
     """
     results = {}
-    
+    #schedulers = ['GradientCosineScheduler','GradientCosineOOPScheduler','LinearLR','ExponentialLR','CosineAnnealingLR','CyclicLR']
+    schedulers = ['GradientCosineSchedulerAuto']
     for config in configs:
         model_name = list(config.keys())[0] + "_" + config[list(config.keys())[0]]
-        print(f"\n{'='*50}")
-        print(f"Benchmarking {model_name} on {dataset_name}")
-        print(f"{'='*50}")
-        
-        results[model_name] = benchmark_model(config, dataset_name, **kwargs)
+        for scheduler_name in schedulers:
+            print(f"\n{'='*50}")
+            print(f"Benchmarking {model_name} on {dataset_name} with {scheduler_name}")
+            print(f"{'='*50}")            
+            benchmark_model(config, dataset_name, scheduler_name, num_epochs)
     
-    return results
+    return "Done"
 
 if __name__ == "__main__":
     # Example configurations
     configs = [
-        {"ResNet": "resnet50"},
+        #{"ResNet": "resnet50"},
+        {"ResNext": "resnext101"}
         # Add more models as needed
         # {"VGG": "vgg16"},
         # {"DenseNet": "densenet121"}
     ]
+    dataset_name="CIFAR100"
+    num_epochs=250
+    batch_size=128
+    initial_lr=0.01
+    final_lr=0.001
     
     # Run benchmarks
     results = run_benchmarks(
-        configs, 
+        configs,
         dataset_name="CIFAR100",
-        num_epochs=50,
+        num_epochs=250,
         batch_size=128,
         initial_lr=0.01,
-        final_lr=0.0001,
-        warmup_epochs=5,
-        gradient_scale=0.15,
+        final_lr=0.001,
+        warmup_epochs=0,
         oscillation_frequency=4.0
     )
     
     print("\nBenchmark completed!")
+    """
     for model_name, result in results.items():
         print(f"{model_name}: Best accuracy = {result['best_acc']:.2f}%, Training time = {result['total_time']:.2f}s")
+    """
