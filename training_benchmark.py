@@ -17,6 +17,33 @@ import torch.optim.lr_scheduler as lr_sch
 from GradientCosineScheduler import GradientCosineScheduler
 from GradientCosineOOPScheduler import GradientCosineOOPScheduler
 import torchvision.models as tmodels
+import random
+from datasets import load_dataset
+
+class imagenetDataset(torch.utils.data.Dataset):
+    def __init__(self, dataset, transform):
+        # Loads the dataset that needs to be transformed
+        self.dataset = load_dataset(name="imagenet-1k", path="/home/o872o/oscargvelasco/nCosAd_learning_rate_scheduler/data/imagenet-1k/", 
+                               split=dataset,
+                               cache_dir="/omics/groups/OE0436/data/oscargvelasco/nCosAd_learning_rate_scheduler/data/imagenet-1k/imagenet_local")
+        self.transform = transform
+        #self.dataset = load_dataset("imagenet-1k", split=f"{dataset}")
+
+    def __getitem__(self, idx):
+        # Sample row idx from the loaded dataset
+        sample = self.dataset[idx]
+
+        # Split up the sample example into an image and label variable
+        image, label = sample['image'], sample['label']
+        
+        if self.transform:
+            image = self.transform(image)
+        
+        return image, label
+
+    def __len__(self):
+        return len(self.dataset)
+
 
 def load_data(dataset_name, batch_size=128, num_workers=4):
     """
@@ -33,17 +60,22 @@ def load_data(dataset_name, batch_size=128, num_workers=4):
     """
     # Define transforms
     train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
+        transforms.Resize((256, 256)),
+        transforms.RandomHorizontalFlip(0.1),
+        transforms.RandomRotation(20),
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        transforms.RandomAdjustSharpness(sharpness_factor = 2, p = 0.1),
+        transforms.ColorJitter(brightness = 0.1, contrast = 0.1, saturation = 0.1),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261)),
+        #transforms.RandomErasing(p=0.75,scale=(0.02, 0.1),value = 1.0, inplace = False)
+        transforms.RandomErasing()
     ])
     
     test_transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+        transforms.Resize((256, 256)),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.247, 0.243, 0.261)),
     ])
-    
     # Select dataset
     if dataset_name.upper() == 'CIFAR10':
         train_dataset = torchvision.datasets.CIFAR10(
@@ -57,6 +89,11 @@ def load_data(dataset_name, batch_size=128, num_workers=4):
         test_dataset = torchvision.datasets.CIFAR100(
             root='./data', train=False, download=False, transform=test_transform)
         num_classes = 100
+    elif dataset_name.upper() == 'IMAGENET1K':
+        train_dataset = imagenetDataset('train', transform = train_transform)
+        test_dataset = imagenetDataset('test', transform = test_transform)
+        num_classes = 1000
+
     else:
         raise ValueError(f"Dataset {dataset_name} not supported")
     
@@ -84,6 +121,8 @@ def get_lr_scheduler(scheduler_name, optimizer, steps_per_epoch, model, num_epoc
         scheduler
     """
     # Select dataset
+    if scheduler_name == 'None':
+        scheduler = None
     if scheduler_name == 'LinearLR':
         scheduler = lr_sch.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=num_epochs)
     if scheduler_name == 'GradientCosineScheduler':
@@ -93,17 +132,17 @@ def get_lr_scheduler(scheduler_name, optimizer, steps_per_epoch, model, num_epoc
         oscillation_frequency=4.0
         scheduler = GradientCosineScheduler(
             optimizer, num_epochs, steps_per_epoch, model,
-            initial_lr=initial_lr, final_lr=final_lr,
+            mode="constant", initial_lr=initial_lr, final_lr=final_lr,
             warmup_epochs=warmup_epochs,
             oscillation_frequency=oscillation_frequency
         )
     if scheduler_name == 'GradientCosineSchedulerAuto':
         initial_lr=0.01
-        final_lr=0.001
+        final_lr=0.0001
         warmup_epochs=0
         oscillation_frequency=4.0
         scheduler = GradientCosineScheduler(
-            optimizer, num_epochs, steps_per_epoch, model,
+            optimizer, num_epochs, steps_per_epoch, model, 
             mode="auto", initial_lr=initial_lr, final_lr=final_lr,
             warmup_epochs=warmup_epochs,
             oscillation_frequency=oscillation_frequency
@@ -117,9 +156,18 @@ def get_lr_scheduler(scheduler_name, optimizer, steps_per_epoch, model, num_epoc
         scheduler = GradientCosineOOPScheduler(
             optimizer, num_epochs, steps_per_epoch, model,
             initial_lr=initial_lr, final_lr=final_lr,
-            warmup_epochs=warmup_epochs,
-            gradient_scale=gradient_scale, 
-            oscillation_frequency=oscillation_frequency
+            warmup_epochs=0, oscillation_frequency=oscillation_frequency
+        )
+    if scheduler_name == 'GradientCosineOOPSchedulerAuto':
+        initial_lr=0.01
+        final_lr=0.001
+        warmup_epochs=0
+        gradient_scale=0.15
+        oscillation_frequency=4.0
+        scheduler = GradientCosineOOPScheduler(
+            optimizer, num_epochs, steps_per_epoch, model,
+            mode="auto", initial_lr=initial_lr, final_lr=final_lr,
+            warmup_epochs=0, oscillation_frequency=oscillation_frequency
         )
     if scheduler_name == 'ExponentialLR':
         scheduler = lr_sch.ExponentialLR(optimizer, gamma=0.9)
@@ -151,6 +199,11 @@ def get_model(config):
     elif model_name == "ResNext":
         if model_config == "resnext101":
             model = tmodels.resnext101_32x8d(weights=None)    
+        else:
+            raise ValueError(f"Unsupported ResNet configuration: {model_config}")
+    elif model_name == "ViT":
+        if model_config == "vit14":
+            model = tmodels.vit_l_16(image_size=256)    
         else:
             raise ValueError(f"Unsupported ResNet configuration: {model_config}")
     # Add more model types here as needed
@@ -187,12 +240,14 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device):
                 scheduler.step()
             elif scheduler and isinstance(scheduler, GradientCosineOOPScheduler):
                 scheduler.step()
+            
             #current_lr = scheduler.actual_lr
             current_lr = optimizer.param_groups[0]["lr"]
+            """
             if scheduler and isinstance(scheduler, GradientCosineOOPScheduler):
                 current_lr = pd.DataFrame([ [i,group["lr"]] for i,group in enumerate(optimizer.param_groups)])
                 current_lr.columns = ["layer", "lr"]
-            
+            """
             running_loss += loss.item()
             _, predicted = outputs.max(1)
             total += targets.size(0)
@@ -200,8 +255,18 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device):
             current_accuracy = 100. * correct / total
 
             # Collect scheduler data
+            """
             if scheduler and isinstance(scheduler, GradientCosineOOPScheduler):
                 step_data = current_lr.assign(epoch=scheduler.last_epoch, step=scheduler._step_count, loss=loss.item(), accuracy=current_accuracy)
+            """
+            if scheduler is None:
+                step_data = {
+                    'epoch': 0,
+                    'step': 0,
+                    'lr': current_lr,
+                    'loss': loss.item(),
+                    'accuracy': current_accuracy
+                }                
             else:
                 step_data = {
                     'epoch': scheduler.last_epoch,
@@ -211,18 +276,28 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device):
                     'accuracy': current_accuracy
                 }
             scheduler_data.append(step_data)
-
             # Update progress bar
-            pbar.set_postfix({
-                'loss': running_loss / (pbar.n + 1),
-                'acc': 100. * correct / total,
-                'lr': optimizer.param_groups[0]['lr'],
-                'avg grad_norm': scheduler.epoch_grad_norms[-1]
-            })
+            if scheduler and isinstance(scheduler, GradientCosineScheduler):
+                pbar.set_postfix({
+                    'loss': running_loss / (pbar.n + 1),
+                    'acc': 100. * correct / total,
+                    'lr': optimizer.param_groups[0]['lr'],
+                    'avg grad_norm': scheduler.epoch_grad_norms[-1]
+                })
+            else:
+                pbar.set_postfix({
+                    'loss': running_loss / (pbar.n + 1),
+                    'acc': 100. * correct / total,
+                    'lr': optimizer.param_groups[0]['lr'],
+                    'avg grad_norm': 0
+                })
+    """
     if scheduler and isinstance(scheduler, GradientCosineOOPScheduler):
         scheduler_df = pd.concat(scheduler_data)
     else:
         scheduler_df = pd.DataFrame(scheduler_data)
+    """
+    scheduler_df = pd.DataFrame(scheduler_data)
     return running_loss / len(train_loader), 100. * correct / total, optimizer.param_groups[0]["lr"], scheduler_df
 
 def validate(model, test_loader, criterion, device):
@@ -252,7 +327,7 @@ def validate(model, test_loader, criterion, device):
     
     return running_loss / len(test_loader), 100. * correct / total
 
-def benchmark_model(config, dataset_name, scheduler_name, num_epochs=100, batch_size=128, 
+def benchmark_model(config, dataset_name, scheduler_name, optimizer_name, num_epochs=100, batch_size=128, 
                    initial_lr=0.01, final_lr=0.00001, warmup_epochs=5, oscillation_frequency=4.0):
     """
     Benchmark a model with the custom scheduler
@@ -291,12 +366,19 @@ def benchmark_model(config, dataset_name, scheduler_name, num_epochs=100, batch_
         if isinstance(model.classifier, nn.Linear):
             in_features = model.classifier.in_features
             model.classifier = nn.Linear(in_features, num_classes)
-    
+
+    if torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
     model = model.to(device)
     
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=initial_lr, momentum=0.9, weight_decay=5e-4)
+    if optimizer_name == 'sgd':
+        optimizer = optim.SGD(model.parameters(), lr=initial_lr, momentum=0.9, weight_decay=5e-4)
+    elif optimizer_name == 'adam':
+        optimizer = optim.Adam(model.parameters(), lr=initial_lr)
+    elif optimizer_name == 'adamw':
+        optimizer = optim.AdamW(model.parameters(), lr=initial_lr)
     # Scheduler
     #scheduler_name = "ExponentialLR"
     #scheduler_name = "LinearLR"
@@ -334,7 +416,7 @@ def benchmark_model(config, dataset_name, scheduler_name, num_epochs=100, batch_
         # 41.29 for Linear
         # 48.9 FOR COSINE
         # 46.46 for Cosine Annealing
-        if val_acc > best_acc and val_acc > 0.9:
+        if val_acc > best_acc and val_acc > 60.0:
             best_acc = val_acc
             model_name = list(config.keys())[0] + "_" + config[list(config.keys())[0]]
             #torch.save(model.state_dict(), f"best_{model_name}_{dataset_name}.pth")
@@ -346,7 +428,7 @@ def benchmark_model(config, dataset_name, scheduler_name, num_epochs=100, batch_
             scheduler.epoch_end()
         elif scheduler and isinstance(scheduler, GradientCosineOOPScheduler):
             scheduler.epoch_end()
-        else:
+        elif scheduler:
             scheduler.step()
 
     # Calculate total time
@@ -355,9 +437,9 @@ def benchmark_model(config, dataset_name, scheduler_name, num_epochs=100, batch_
     results_val = pd.DataFrame(results_val)
     # Save results
     model_name = list(config.keys())[0] + "_" + config[list(config.keys())[0]]
-    results_file = f"benchmark_{model_name}_{dataset_name}_{scheduler_name}.csv"
+    results_file = f"benchmark_{model_name}_{dataset_name}_{scheduler_name}_{optimizer_name}_{str(batch_size)}.csv"
     results.to_csv(results_file)
-    results_file_val = f"benchmark_{model_name}_{dataset_name}_{scheduler_name}_validation.csv"
+    results_file_val = f"benchmark_{model_name}_{dataset_name}_{scheduler_name}_{optimizer_name}_{str(batch_size)}_validation.csv"
     results_val.to_csv(results_file_val)
     print("Training Finished")
     print("Maximum Validation Acc: "+ str(best_acc))
@@ -425,7 +507,7 @@ def plot_results(results, results_val):
     plt.savefig(f"benchmark_{model_name}_{results['dataset']}.png")
     plt.close()
 
-def run_benchmarks(configs, dataset_name, num_epochs=100, **kwargs):
+def run_benchmarks(configs, dataset_name, optimizer_name, num_epochs=100, batch_size=64,initial_lr=0.01, final_lr=0.001, warmup_epochs=0, oscillation_frequency=4.0):
     """
     Run benchmarks for multiple model configurations
     
@@ -435,43 +517,54 @@ def run_benchmarks(configs, dataset_name, num_epochs=100, **kwargs):
         **kwargs: Additional arguments for benchmark_model function
     """
     results = {}
-    #schedulers = ['GradientCosineScheduler','GradientCosineOOPScheduler','LinearLR','ExponentialLR','CosineAnnealingLR','CyclicLR']
-    schedulers = ['GradientCosineSchedulerAuto']
+    #schedulers = ['GradientCosineScheduler','GradientCosineSchedulerAuto','CosineAnnealingLR','None','LinearLR','ExponentialLR','CyclicLR']
+    schedulers = ['CosineAnnealingLR']
+    #schedulers = ['None']
     for config in configs:
         model_name = list(config.keys())[0] + "_" + config[list(config.keys())[0]]
         for scheduler_name in schedulers:
             print(f"\n{'='*50}")
             print(f"Benchmarking {model_name} on {dataset_name} with {scheduler_name}")
             print(f"{'='*50}")            
-            benchmark_model(config, dataset_name, scheduler_name, num_epochs)
-    
+            benchmark_model(config, dataset_name, scheduler_name, optimizer_name, num_epochs, batch_size)
+
     return "Done"
 
 if __name__ == "__main__":
     # Example configurations
     configs = [
         #{"ResNet": "resnet50"},
-        {"ResNext": "resnext101"}
+        #{"ResNext": "resnext101"},
+        {"ViT": "vit14"}
         # Add more models as needed
         # {"VGG": "vgg16"},
         # {"DenseNet": "densenet121"}
     ]
+
+    SEED = 1505
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed(SEED)
+    """
     dataset_name="CIFAR100"
     num_epochs=250
     batch_size=128
     initial_lr=0.01
-    final_lr=0.001
-    
+    final_lr=0.0001
+    """
     # Run benchmarks
     results = run_benchmarks(
         configs,
         dataset_name="CIFAR100",
-        num_epochs=250,
+        #dataset_name="IMAGENET1K",
+        optimizer_name="sgd",
+        num_epochs=500,
         batch_size=128,
         initial_lr=0.01,
-        final_lr=0.001,
+        final_lr=0.0001,
         warmup_epochs=0,
-        oscillation_frequency=4.0
+        oscillation_frequency=16.0
     )
     
     print("\nBenchmark completed!")

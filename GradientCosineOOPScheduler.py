@@ -1,12 +1,52 @@
+"""
+File: GradientCosineOOPScheduler
+Author: Óscar González-Velasco, PhD
+Email: oscargvelasco@gmail.com / oscar.gonzalezvelasco@dkfz-heidelberg.de
+Date: 17 March 2025
+
+This code provides a custom PyTorch learning rate scheduler that implements a modified Out Of Phase (OOP) version of Gradient-aware Cosine with linear decay 
+learning rate scheduler:
+- GraCos -
+
+Learning Rate follows a Cosine oscillation within each epoch (LR is adjusted per step).
+OOP version will produce an Out Of Phase Cosine wave across layers (each layer will be slightly out of phase from the previos layer). This
+means that each layer will have an independent LR value, that also will oscillate across steps using a cosine wave function, out of phase
+in contrast with the rest of the layers.
+
+The Cosine oscillation pattern follows a descending linear trajectory towards a defined minimum learning rate: the equilibrium LR from which
+the wave oscillates decreases steadily each epoch.
+The <auto> mode incorporates a Gradient-based modulation - the amplitude and frequency of oscillations are affected by MAV gradient 
+magnitudes (computed at the end of each epoch).
+
+Cosine wave Documentation:
+http://labman.phys.utk.edu/phys135core/modules/m9/harmonic_motion.html#:~:text=x(t)%20%3D%20A%20cos,return%20to%20the%20starting%20position.
+
+Features:
+
+Warm-up period: Optional linear warm-up for stable initial training
+Base trajectory: Linear descent towards zero, with oscillations around this trajectory
+Initial oscillation amplitude: default 1 = 100% of initial LR value.
+For example, if base LR is 0.01, initial amplitud=lr -> maximum lr value per oscillation = 0.02
+
+Phase offset for cosine function:
+*Added phase_offset = math.pi / 2 to start the cosine at its lowest point
+This ensures the first value is below the linear decay trajectory, used as a natural
+warm-up period.
+
+
+Early-stage blending:
+Special handling for the initial phase of training
+Gradually blends from the initial lower rate to the regular oscillating schedule
+This gives a smooth transition from the low starting point
+"""
 import torch
 from torch.optim.lr_scheduler import _LRScheduler
 import math
 
 class GradientCosineOOPScheduler(_LRScheduler):
     def __init__(self, optimizer, total_epochs, steps_per_epoch, model, 
-                 initial_lr=0.01, final_lr=0.00001, 
-                 warmup_epochs=0,
-                 gradient_scale=0.15, oscillation_frequency=4.0,
+                 mode="constant", initial_lr=0.01, final_lr=0.00001, 
+                 warmup_epochs=0, oscillation_frequency=4.0,
                  last_epoch=-1, verbose=False):
         """
         Args:
@@ -31,6 +71,7 @@ class GradientCosineOOPScheduler(_LRScheduler):
         self.min_lr = final_lr
         self.alpha = final_lr*0.1
         self.model = model
+        self.mode = mode
         # Warm-up and init lr
         self.warmup_epochs = warmup_epochs
         # No warmup
@@ -39,7 +80,7 @@ class GradientCosineOOPScheduler(_LRScheduler):
         self.phi=math.pi
         self.phase_shift = None
         #  calling the constructor (initialization method) of the parent class that GradientCosineScheduler inherits from, which is PyTorch's _LRScheduler.
-        super(GradientCosineOOPScheduler, self).__init__(optimizer, last_epoch, verbose)
+        #super(GradientCosineOOPScheduler, self).__init__(optimizer, last_epoch, verbose)
         # Tracking variables
         self.last_epoch = 0
         self._step_count = 0
@@ -56,17 +97,12 @@ class GradientCosineOOPScheduler(_LRScheduler):
         self.linear_step_decay = (self.initial_lr - self.min_lr)*(1- ((self.total_steps-1) / self.total_steps))
 
         # Oscillation parameters
-        self.oscillation_amplitude = initial_lr*0.8
-        self.gradient_scale = gradient_scale
+        self.oscillation_amplitude = initial_lr*1
         self.base_oscillation_frequency = oscillation_frequency
-        self.oscillation_frequency = oscillation_frequency
-        
-        # Model size and gradient tracking
-        self.num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        self.model_size_factor = math.log10(max(1, self.num_params)) / 10
+        #self.oscillation_frequency = oscillation_frequency
+        self.oscillation_frequency = round(math.sqrt(self.steps_per_epoch))
         
         # Gradient norm tracking
-        self.last_grad_norm = 1.0
         self.epoch_grad_norms = []
                 
         # Initialize base learning rates
@@ -126,8 +162,6 @@ class GradientCosineOOPScheduler(_LRScheduler):
             
     def get_lr(self):
         # Oscillation amplitude modulated by gradient norm
-        gradient_factor = min(1.0, self.last_grad_norm * self.gradient_scale)
-        self.oscillation_amplitude = self.base_lr*0.8
         W = (2 * math.pi) / (self.steps_per_epoch/self.oscillation_frequency)
 
         # Compute learning rate with oscillation
@@ -197,7 +231,6 @@ class GradientCosineOOPScheduler(_LRScheduler):
         Adjust oscillation frequency based on gradient behavior in the previous epoch.
         Called at the end of each epoch to set frequency for the next epoch.
         """
-        self.steps_in_current_epoch = 0
         self.last_epoch += 1
         self.oscillation_amplitude = self.base_lr
         
@@ -212,10 +245,17 @@ class GradientCosineOOPScheduler(_LRScheduler):
         normalized_variance = min(2.0, max(0.5, 1.0 + grad_variance / (avg_grad_norm + 1e-8)))
         print(f"Epoch {self.last_epoch}: Normalized variance: {self.normalized_variance:.4f}")
 
-        # Adjust frequency based on gradient behavior
-        # Higher variance → more oscillations needed for exploration
-        # Lower variance → fewer oscillations for exploitation
-        #self.current_frequency = self.base_oscillations_per_epoch * normalized_variance / (1.0 + self.model_size_factor)
+        # Gradient-aware amplitude and freq. modulation
+        if self.mode=="auto" and self.last_epoch>0:
+            grad_factor = max(0.05, min(1.5, (1/math.exp(avg_grad_norm))))
+            self.oscillation_amplitude = self.base_lr * grad_factor
+            #self.oscillation_frequency = round(1/grad_factor)
+            #self.oscillation_frequency = round(1/grad_factor) + int(math.log10(self.steps_per_epoch))
+            self.oscillation_frequency = round(math.sqrt(self.steps_per_epoch))
+            # IDEA
+            #self.oscillation_frequency = round(math.sqrt(self.steps_per_epoch) / math.exp(avg_grad_norm))
+        elif self.mode=="constant":
+            self.oscillation_amplitude = self.base_lr * 1
         
         # Reset for next epoch
         self.epoch_grad_norms = []
@@ -223,31 +263,22 @@ class GradientCosineOOPScheduler(_LRScheduler):
         if self.verbose:
             print(f"Epoch {self.last_epoch}: Setting oscillation frequency to {self.current_frequency:.4f}")
     
-    def update_gradient_norm(self, optimizer=None):
+    def update_gradient_norm(self):
         """
         Update the gradient norm tracker based on current gradients.
         Call this method after loss.backward() but before optimizer.step()
-        
-        Args:
-            optimizer: Optional. If None, uses the optimizer this scheduler is attached to.
-        """
-        if optimizer is None:
-            optimizer = self.optimizer
-            
-        total_norm = 0.0
-        param_count = 0
-        
-        for param_group in optimizer.param_groups:
-            for p in param_group['params']:
-                if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)
-                    total_norm += param_norm.item() ** 2
-                    param_count += 1
-        
-        if param_count > 0:
-            avg_norm = math.sqrt(total_norm / param_count)
-            # Use exponential moving average to smooth gradient norm changes
-            self.last_grad_norm = 0.9 * self.last_grad_norm + 0.1 * avg_norm
-            self.epoch_grad_norms.append(avg_norm)
-        
-        return self.last_grad_norm
+        """            
+        # More efficient version
+        with torch.no_grad():  # Prevents tracking unnecessary computations
+            total_norm = 0.0
+            param_count = 0
+            # Vectorized approach for all parameters at once
+            all_grads = [p.grad.view(-1) for param_group in self.optimizer.param_groups
+                         for p in param_group['params'] if p.grad is not None]           
+            if all_grads:  # Check if there are any gradients
+                all_grads_cat = torch.cat(all_grads)
+                total_norm = all_grads_cat.norm(2).item() ** 2
+                param_count = len(all_grads)
+                avg_norm = math.sqrt(total_norm / param_count)
+        self.epoch_grad_norms.append(avg_norm)
+        return avg_norm

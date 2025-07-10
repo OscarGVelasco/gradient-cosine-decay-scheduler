@@ -1,3 +1,39 @@
+"""
+File: GradientCosineScheduler
+Author: Óscar González-Velasco, PhD
+Email: oscargvelasco@gmail.com / oscar.gonzalezvelasco@dkfz-heidelberg.de
+Date: 17 March 2025
+
+This code provides a custom PyTorch learning rate scheduler that implements a Gradient-aware Cosine with linear decay learning rate scheduler:
+- GraCos -
+
+Learning Rate follows a Cosine oscillation within each epoch (LR is adjusted per step).
+The Cosine oscillation pattern follows a descending linear trajectory towards a defined minimum learning rate: the equilibrium LR from which
+the wave oscillates decreases steadily each epoch.
+The <auto> mode incorporates a Gradient-based modulation - the amplitude and frequency of oscillations are affected by MAV gradient 
+magnitudes (computed at the end of each epoch).
+
+Cosine wave Documentation:
+http://labman.phys.utk.edu/phys135core/modules/m9/harmonic_motion.html#:~:text=x(t)%20%3D%20A%20cos,return%20to%20the%20starting%20position.
+
+Features:
+
+Warm-up period: Optional linear warm-up for stable initial training
+Base trajectory: Linear descent towards zero, with oscillations around this trajectory
+Initial oscillation amplitude: default 1 = 100% of initial LR value.
+For example, if base LR is 0.01, initial amplitud=lr -> maximum lr value per oscillation = 0.02
+
+Phase offset for cosine function:
+*Added phase_offset = math.pi / 2 to start the cosine at its lowest point
+This ensures the first value is below the linear decay trajectory, used as a natural
+warm-up period.
+
+
+Early-stage blending:
+Special handling for the initial phase of training
+Gradually blends from the initial lower rate to the regular oscillating schedule
+This gives a smooth transition from the low starting point
+"""
 import torch
 from torch.optim.lr_scheduler import _LRScheduler
 import math
@@ -39,7 +75,7 @@ class GradientCosineScheduler(_LRScheduler):
         # If no warmpup we start the wave at maximum x negative position
         self.phi=math.pi
         #  calling the constructor (initialization method) of the parent class that GradientCosineScheduler inherits from, which is PyTorch's _LRScheduler.
-        super(GradientCosineScheduler, self).__init__(optimizer, last_epoch, verbose)
+        #super(GradientCosineScheduler, self).__init__(optimizer, last_epoch, verbose)
         # Tracking variables
         self.last_epoch = 0
         self._step_count = 0
@@ -56,7 +92,8 @@ class GradientCosineScheduler(_LRScheduler):
         self.linear_step_decay = (self.initial_lr - self.min_lr)*(1- ((self.total_steps-1) / self.total_steps))
         # Initial Oscillation parameters
         self.oscillation_amplitude = initial_lr*1
-        self.oscillation_frequency = oscillation_frequency        
+        #self.oscillation_frequency = oscillation_frequency
+        self.oscillation_frequency = round(math.sqrt(self.steps_per_epoch))
 
         # Gradient norm tracking
         self.epoch_grad_norms = []
@@ -165,12 +202,15 @@ class GradientCosineScheduler(_LRScheduler):
         grad_variance = sum((g - avg_grad_norm) ** 2 for g in self.epoch_grad_norms) / len(self.epoch_grad_norms)
         # Gradient-aware amplitude and freq. modulation
         if self.mode=="auto" and self.last_epoch>0:
-            grad_factor = max(0.05, min(1.5, avg_grad_norm))
+            grad_factor = max(0.05, min(1.5, (1/math.exp(avg_grad_norm))))
             self.oscillation_amplitude = self.base_lr * grad_factor
-            self.oscillation_frequency = round(1/grad_factor)
-            self.oscillation_frequency = round(1/grad_factor) + int(math.log10(self.steps_per_epoch))
+            #self.oscillation_frequency = round(1/grad_factor)
+            #self.oscillation_frequency = round(1/grad_factor) + int(math.log10(self.steps_per_epoch))
+            self.oscillation_frequency = round(math.sqrt(self.steps_per_epoch))
+            # IDEA
+            #self.oscillation_frequency = round(math.sqrt(self.steps_per_epoch) / math.exp(avg_grad_norm))
         elif self.mode=="constant":
-            self.oscillation_amplitude = self.base_lr * 0.5
+            self.oscillation_amplitude = self.base_lr * 1
 
         self.steps_in_current_epoch = 0
         self.last_epoch += 1
