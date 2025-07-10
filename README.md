@@ -2,12 +2,13 @@
 
 This code provides a custom PyTorch learning rate scheduler that implements a Gradient-aware Cosine with linear decay 
 learning rate scheduler:
-- GraCos -
+< GraCos >
 
-## Versions: 
+### Versions: 
 
-GradientCosineScheduler: Learning Rate follows a Cosine that oscillates within each epoch (LR is adjusted per step).
-GradientCosineOOPScheduler: Modified Out Of Phase (OOP) version of the GradientCosineScheduler. OOP version will produce an Out Of Phase Cosine wave across layers (each layer will be slightly out of phase from the previos layer). This means that each layer will have an independent LR value, that also will oscillate across steps using a cosine wave function, out of phase in contrast with the rest of the layers.
+- GradientCosineScheduler: Learning Rate follows a Cosine that oscillates within each epoch (LR is adjusted per step).
+
+- GradientCosineOOPScheduler: Modified Out Of Phase (OOP) version of the GradientCosineScheduler. OOP version will produce an Out Of Phase Cosine wave across layers (each layer will be slightly out of phase from the previos layer). This means that each layer will have an independent LR value, that also will oscillate across steps using a cosine wave function, out of phase in contrast with the rest of the layers.
 
 # The Scheduler:
 
