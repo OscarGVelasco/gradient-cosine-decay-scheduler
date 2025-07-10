@@ -9,7 +9,7 @@ learning rate scheduler:
 - GraCos -
 
 Learning Rate follows a Cosine oscillation within each epoch (LR is adjusted per step).
-OOP version will produce an Out Of Phase Cosine wave across layers (each layer will be slightly out of phase from the previos layer). This
+OOP version will produce an Out Of Phase Cosine wave across layers (each layer will be slightly out of phase from the previous layer). This
 means that each layer will have an independent LR value, that also will oscillate across steps using a cosine wave function, out of phase
 in contrast with the rest of the layers.
 
